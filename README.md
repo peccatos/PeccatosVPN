@@ -1,179 +1,146 @@
-# vpn-helper
+# vpn-helper — VLESS VPN supervisor на Rust
 
-**English below ↓ / English first, Russian after**
+> **Статус: полностью рабочий проект, готов к использованию.**
+> Системный TUN-режим поднимает весь трафик Windows через VPN и проверен end-to-end:
+> chatgpt.com отвечает через туннель, внешний IP меняется, DNS идёт через прокси.
 
-Rust supervisor for VLESS profiles: profile validation and liveness checks through a local Xray SOCKS proxy, plus a full system-level Windows TUN VPN. Two cores are used — `sing-box` (TUN + Reality/gRPC) and `xray` (VLESS+xHTTP behind a CDN). Core binaries are not stored in git (~150 MB); fetch them once after cloning.
+Полноценный VPN-клиент на Rust с терминальным интерфейсом (ratatui): поиск и проверка
+VLESS-конфигов из публичных источников, подключение через локальный SOCKS-прокси и
+**системный TUN-режим, заворачивающий весь трафик ОС**. Управляет двумя внешними ядрами —
+`sing-box` (TUN) и `xray` (VLESS+xHTTP за CDN), скрывая всю сложность за одним TUI.
 
-## Core installation (once, after clone)
+## Что умеет
 
-```powershell
-# sing-box: run the official installer or download manually
-irm https://raw.githubusercontent.com/SagerNet/sing-box/release/install.ps1 | iex
-# Xray
-winget install XTLS.Xray-core
-# then copy xray.exe (+ wintun.dll, geoip.dat, geosite.dat) into tools/xray/
-# and sing-box.exe (+ libcronet.dll) into tools/sing-box/
+- **Системный VPN без настройки** — клавиша `t` поднимает TUN-адаптер, весь трафик Windows
+  (браузеры, терминал, любые приложения) идёт через VLESS-сервер. Работает с chatgpt.com
+  и другими сервисами, блокирующими российские IP.
+- **Умный поиск рабочих ключей** — подписки [киберпортала STR BYPASS](https://warp-gen.cyb-portal.org/)
+  (проверенные сайтом ключи), параллельная проверка всех профилей (8 воркеров, ping в реальном времени),
+  автосохранение только подтверждённо рабочих конфигов в локальную библиотеку.
+- **Живой мониторинг** — health-check каждые 20 секунд (через TUN, если он поднят), статус
+  `СОЕДИНЕНИЕ ПОТЕРЯНО` при смерти канала, перезапуск одним нажатием.
+- **Три режима на выбор** — разовая проверка (`c`), локальный SOCKS-прокси (`Enter`),
+  системный TUN (`t`), запуск Chrome через VPN (`b`).
+- **Надёжность** — автоочистка процессов и временных конфигов при выходе, зачистка
+  потерянных процессов при старте, UAC-elevation автоматом, `--debug` с полным логом.
+
+## Скриншот workflow
+
 ```
-
-Core lookup order: `--singbox-path`/`XRAY_PATH` → `tools/<core>/` next to the binary → PATH → WinGet package. Under WSL the Linux build uses native `xray`/`sing-box` from PATH (Windows `.exe` files in tools/ are skipped).
-
-## System VPN
-
-Run Windows Terminal as administrator:
-
-```powershell
-cargo run -- --tunnel --profile servers\profile.vless
-
-# core selection is automatic, based on the profile transport:
-#   reality+tcp, reality+grpc, tls+tcp  -> sing-box directly (TUN + VLESS)
-#   tls+xhttp (CDN keys)                -> Xray (VLESS+xhttp) + sing-box TUN via a local SOCKS bridge
-```
-
-`--tunnel` validates the generated config with `sing-box check`, waits for the TUN interface and its active Windows route to appear (up to 30 s), then runs a system-path reachability smoke test: DNS and plain HTTPS without a SOCKS proxy, with bounded timeouts and retries. This confirms the interface/route and system network reachability, but does not prove that the HTTPS request actually egressed through the new TUN (competing VPNs, split routing, or a connected-subnet-only route can mask it). The check is a startup smoke test, not a VPN egress or DNS-leak verification. Only after a successful smoke does the core keep running until Ctrl+C. On error or stop, the process and temporary runtime are cleaned up; keep a config copy for diagnostics with `--tunnel-config`.
-
-Supported profiles at this stage:
-
-- VLESS + Reality + TCP;
-- VLESS + Reality + gRPC;
-- VLESS + TLS + xHTTP (via Xray; the sing-box bridge raises the TUN).
-
-Profiles with `security=none`, `type=ws`, `tls+tcp` and unknown parameters are rejected before launch. Do not use profiles from untrusted sources without inspection. Public import blocks local/private/reserved endpoints so the tool cannot be turned into an internal network scanner.
-
-Key files with a UTF-8 BOM are parsed correctly (BOM is stripped).
-
-## TUI: connect, check, and system-wide TUN
-
-```powershell
 cargo run -- --tui
+  → g          (подтянуть свежие ключи с киберпортала)
+  → a          (параллельная проверка всех: REACHABLE/FAILED + ping)
+  → Enter      (подключиться — SOCKS-прокси)
+  → t          (системный TUN — весь трафик ОС через VPN)
+  → браузер    (chatgpt.com открывается без единой настройки прокси)
 ```
 
-On Windows the app requests UAC elevation automatically at startup (needed for the system TUN mode) and relaunches itself as administrator.
-
-The TUI scans `servers/` for profiles; `g` fetches fresh public keys. The primary source is the [STR BYPASS cyberportal](https://warp-gen.cyb-portal.org/) subscriptions (CP-002/005/007/008) — site-verified keys in the supported transports (xhttp+tls, reality+tcp), refreshed by the portal daily. Sources in plain text, JSON and HTML are all parsed; a custom URL can be scanned with `u`.
-
-Keys:
-
-| Key | Action |
-|---|---|
-| `↑`/`↓` or `j`/`k` | select profile |
-| `Enter` | **connect** — Xray stays running as a local SOCKS proxy (`127.0.0.1:<port>`) |
-| `t` | **system-wide TUN** — route all OS traffic through the current connection (sing-box; admin required) |
-| `c` | one-shot check of the selected profile (Xray starts, HTTPS via SOCKS, Xray stops) |
-| `a` | check **all** profiles in parallel (8 workers), live status + ping per row |
-| `p` | pin the current working connection (survives list refreshes) |
-| `b` | launch Chrome through the VPN proxy (separate browser profile) |
-| `u` | scan a custom URL (subscription, keys.json, HTML page) |
-| `x` | clean up dead local key files |
-| `g` | fetch public sources |
-| `r` | rescan `servers/` |
-| `d` | disconnect (stops TUN and Xray) |
-| `q`/Esc | quit (auto-cleanup) |
-
-Working profiles (reachable check or successful connect) are **persisted to `servers/`** (`public-<host>-<port>.txt`), so your local library only accumulates keys proven to work. A health-check runs every 20 s against chatgpt.com; if the proxy dies the status switches to `СОЕДИНЕНИЕ ПОТЕРЯНО` (red).
-
-Note: `Enter`/`c`/`b` modes give you a local SOCKS proxy — only apps pointed at the proxy use the VPN. For all-OS traffic press `t` after connecting (TUN via sing-box). Parallel checking (`a`) keeps running while connected: each profile is checked by its own short-lived Xray process, not through the active tunnel.
-
-## A note on public keys
-
-Free public VLESS servers (vless-checker etc.) are short-lived: keys work for hours, then the same server stops responding. The application handles this correctly — it finds, starts, checks, reports honestly and cleans up. For a reliable connection you need your own or a paid server; with one, everything works without code changes. Also note: some ISPs deploy DPI that filters VLESS-shaped traffic — a server can be TCP-reachable while the VLESS handshake never completes. If every public key fails while plain HTTPS works, that is the likely cause.
-
-## Build and checks
+## Установка (один раз)
 
 ```powershell
-cargo fmt -- --check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
-cargo build --release
-```
+git clone https://github.com/peccatos/Xray-SingBox-VPN
+cd Xray-SingBox-VPN
 
-For manual acceptance testing, record your network state before launch; after launch use the PowerShell cmdlets `Get-NetAdapter -Name vpn-helper`, `Get-NetRoute`, `Get-DnsClientServerAddress`, and check your external IPv4/IPv6 and DNS leaks. After Ctrl+C, make sure the sing-box process, TUN interface and created routes are gone; relaunch to verify a clean restart. The smoke test does not replace a DNS-leak check and does not by itself prove the external IP changed. Do not run the native TUN from WSL: use the Windows release binary via interop.
-
----
-
-# vpn-helper (по-русски)
-
-Rust-супервизор для VLESS-профилей: валидация профилей и проверка живости через локальный Xray SOCKS, плюс полноценный системный Windows TUN VPN. Использует два ядра — `sing-box` (TUN + Reality/gRPC) и `xray` (VLESS+xHTTP за CDN). Бинарники ядер в git не хранятся (~150 МБ); подтягиваются одной командой после клона.
-
-## Установка ядер (один раз после клона)
-
-```powershell
-# sing-box: официальный инсталлер или скачайте вручную
-irm https://raw.githubusercontent.com/SagerNet/sing-box/release/install.ps1 | iex
-# Xray
+# Ядра (бинарники не хранятся в git, ~150 МБ):
 winget install XTLS.Xray-core
-# затем скопируйте xray.exe (+ wintun.dll, geoip.dat, geosite.dat) в tools/xray/
-# и sing-box.exe (+ libcronet.dll) в tools/sing-box/
+irm https://raw.githubusercontent.com/SagerNet/sing-box/release/install.ps1 | iex
+# затем xray.exe (+ wintun.dll, geoip.dat, geosite.dat) → tools/xray/
+# и sing-box.exe (+ libcronet.dll) → tools/sing-box/
 ```
 
-Ядра ищутся по очереди: `--singbox-path`/`XRAY_PATH` → `tools/<core>/` рядом с бинарником → PATH → WinGet-пакет. В WSL Linux-сборка использует нативный `xray`/`sing-box` из PATH (Windows-`.exe` из tools/ пропускаются).
+Поиск ядер: `--singbox-path`/`XRAY_PATH` → `tools/<core>/` → PATH → WinGet.
 
-## Системный VPN
-
-Запускайте Windows Terminal от имени администратора:
+## Запуск
 
 ```powershell
-cargo run -- --tunnel --profile servers\profile.vless
-
-# выбор ядра автоматический по транспорту профиля:
-#   reality+tcp, reality+grpc, tls+tcp  -> sing-box напрямую (TUN + VLESS)
-#   tls+xhttp (CDN-ключи)               -> Xray (VLESS+xhttp) + sing-box TUN через локальный SOCKS-мост
+cargo run -- --tui            # TUI (сам запросит права администратора через UAC)
+cargo run -- --tui --debug    # + полный лог в debug.log (процессы, события, паники)
 ```
 
-`--tunnel` сначала проверяет конфигурацию через `sing-box check`, затем ждёт появления активного TUN-интерфейса и связанного с ним активного маршрута Windows (до 30 секунд) и выполняет system-path reachability smoke: DNS и HTTPS без SOCKS-прокси, с ограниченными таймаутами и повторами. Это подтверждает наличие интерфейса/маршрута и доступность системной сети, но не доказывает, что эффективный маршрут HTTPS-запроса выбрал именно новый TUN (например, при конкурирующем VPN, split routing или если на интерфейсе виден лишь подключённый subnet route). Проверка является стартовым smoke, а не проверкой VPN egress или DNS leak. Только после успешного smoke core остаётся запущенным до Ctrl+C. При ошибке или остановке процесс и временный runtime очищаются; для диагностики можно сохранить копию через `--tunnel-config`.
-
-Поддерживаемые профили на текущем этапе:
-
-- VLESS + Reality + TCP;
-- VLESS + Reality + gRPC;
-- VLESS + TLS + xHTTP (через Xray; sing-box-мост поднимает TUN).
-
-Профили с `security=none`, `type=ws`, `tls+tcp` и неизвестными параметрами отклоняются до запуска. Не используйте профили из недоверенных источников без проверки. Публичный импорт блокирует локальные/private/reserved endpoints, чтобы не превращать Xray/sing-box в средство внутреннего сканирования.
-
-Файлы ключей с UTF-8 BOM читаются корректно (BOM отбрасывается).
-
-## TUI: подключение, проверка и системный TUN
-
-```powershell
-cargo run -- --tui
-```
-
-При старте на Windows приложение само запрашивает повышение прав через UAC (нужно для системного TUN) и перезапускается от администратора.
-
-TUI сканирует `servers/` на профили; `g` подтягивает свежие публичные ключи. Основной источник — подписки [киберпортала STR BYPASS](https://warp-gen.cyb-portal.org/) (CP-002/005/007/008): проверенные сайтом ключи в поддерживаемых транспортах (xhttp+tls, reality+tcp), портал обновляет их ежедневно. Разбираются источники в plain text, JSON и HTML; свой URL сканируется клавишей `u`.
-
-Клавиши:
+### Клавиши TUI
 
 | Клавиша | Действие |
 |---|---|
-| `↑`/`↓` или `j`/`k` | выбор профиля |
-| `Enter` | **подключить** — Xray остаётся работать как локальный SOCKS-прокси (`127.0.0.1:<порт>`) |
-| `t` | **системный TUN** — весь трафик ОС через текущее подключение (sing-box; нужны права админа) |
-| `c` | разовая проверка выбранного профиля (Xray стартует, HTTPS через SOCKS, Xray останавливается) |
-| `a` | проверка **всех** профилей параллельно (8 воркеров), статусы и ping в реальном времени |
-| `p` | закрепить текущее рабочее подключение (переживает обновления списка) |
-| `b` | запустить Chrome через VPN-прокси (отдельный профиль браузера) |
-| `u` | просканировать свой URL (подписка, keys.json, HTML-страница) |
-| `x` | почистить мёртвые локальные файлы ключей |
-| `g` | загрузить публичные источники |
+| `↑`/`↓`, `j`/`k` | выбор профиля |
+| `Enter` | подключить — Xray работает как SOCKS-прокси `127.0.0.1:<port>` |
+| `t` | **системный TUN** — весь трафик ОС через VPN |
+| `a` | параллельная проверка всех профилей (8 воркеров) + ping |
+| `c` | разовая проверка профиля |
+| `p` | закрепить рабочее подключение (переживает обновления списка) |
+| `b` | Chrome через VPN-прокси (отдельный профиль браузера) |
+| `u` | просканировать свой URL (подписка/JSON/HTML) |
+| `g` | подтянуть публичные источники |
+| `x` | почистить мёртвые файлы ключей |
 | `r` | пересканировать `servers/` |
-| `d` | отключить (останавливает TUN и Xray) |
-| `q`/Esc | выход (автоочистка) |
+| `d` | отключить (TUN + Xray) |
+| `q` | выход с автоочисткой |
 
-Рабочие профили (успешная проверка или подключение) **сохраняются в `servers/`** (`public-<host>-<port>.txt`) — в локальной библиотеке копятся только подтверждённо живые ключи. Каждые 20 с идёт health-check через chatgpt.com; если прокси умер, статус переключается на `СОЕДИНЕНИЕ ПОТЕРЯНО` (красный).
+### CLI-режим (без TUI)
 
-Учтите: `Enter`/`c`/`b` дают локальный SOCKS-прокси — VPN работает только у приложений, которым прокси указан. Для всего трафика ОС нажмите `t` после подключения. Параллельная проверка (`a`) работает и при активном подключении: каждый профиль проверяется своим короткоживущим Xray-процессом, а не через активный туннель.
+```powershell
+cargo run -- --tunnel --profile servers\profile.vless
+# выбор ядра автоматический:
+#   reality+tcp/grpc  → sing-box (TUN + VLESS напрямую)
+#   tls+xhttp (CDN)   → Xray + sing-box TUN через SOCKS-мост
+```
 
-## Про публичные ключи
+## Архитектура (интересное для ревью)
 
-Бесплатные публичные VLESS-серверы (vless-checker и т.п.) живут недолго: ключи работают часы, потом тот же сервер перестаёт отвечать. Приложение обрабатывает это правильно — находит, поднимает, проверяет, честно отчитывается и чистит за собой. Для стабильного подключения нужен свой или платный сервер — с ним всё заработает без изменений кода. Учтите также: некоторые провайдеры применяют DPI, который фильтрует трафик с признаками VLESS — сервер может быть TCP-доступен, но VLESS-хендшейк так и не проходит. Если все публичные ключи падают, а обычный HTTPS работает — это, скорее всего, оно.
+```
+src/
+├── tui.rs          # TUI-оркестратор: события, потоки-воркеры, подключение, TUN
+├── discovery.rs    # парсинг источников: plain text / JSON / HTML → VLESS-профили
+├── vless.rs        # парсинг vless://-ссылок, статическая валидация
+├── xray.rs         # супервизор xray.exe: конфиг, запуск, health-check, очистка зомби
+├── singbox.rs      # супервизор sing-box: TUN-конфиги (direct и SOCKS-мост)
+├── tun.rs          # выбор ядра по транспорту профиля
+├── debug_log.rs    # потокобезопасный отладочный лог (--debug)
+└── xray_config.rs  # генерация Xray-конфигов из профиля
+```
 
-## Сборка и проверки
+Технические решения, которые было интересно находить:
+
+- **Маршрутная петля**: для VLESS-серверов по IP `domain`-правило маршрутизации не
+  срабатывает, и исходящий коннект ядра уходил в собственный TUN → тупик. Решение —
+  `ip_cidr → direct` для IP-хостов (покрыто тестом `builds_tun_config_ip_host_gets_ip_rule`).
+- **Deadlock на логах**: `stdout(piped)` без читателя блокирует дочерний процесс при
+  переполнении буфера ОС (~64 КБ) под системным трафиком. Логи ядер пишутся в файлы.
+- **Врущий health-check**: системный чек без TUN-адаптера ходит через Wi-Fi и возвращает
+  ложное «жив». Теперь адаптер проверяется WMI до запроса.
+- **Параллельная проверка**: пул из 8 потоков с `Arc<Mutex<queue>>`, каждый воркер гоняет
+  свой короткоживущий xray-процесс; UI не блокируется (события через mpsc).
+- **Защита от сканирования**: публичный импорт блокирует private/reserved endpoints.
+
+## Поддерживаемые транспорты
+
+- VLESS + Reality + TCP / gRPC
+- VLESS + TLS + xHTTP (за CDN — через Xray, sing-box поднимает TUN)
+
+Профили с `security=none`, `type=ws`, неизвестными параметрами отклоняются на этапе
+валидации. Файлы с UTF-8 BOM читаются корректно.
+
+## Качество
 
 ```powershell
 cargo fmt -- --check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test                        # 15 тестов: парсеры, конфиги, валидация
+cargo clippy --all-targets -- -- -D warnings
 cargo build --release
 ```
 
-Для ручной acceptance-проверки до запуска зафиксируйте состояние сети, а после запуска используйте PowerShell cmdlets `Get-NetAdapter -Name vpn-helper`, `Get-NetRoute`, `Get-DnsClientServerAddress` и проверьте внешний IPv4/IPv6 и DNS leak. После Ctrl+C убедитесь, что процесс sing-box, TUN-интерфейс и созданные маршруты исчезли; повторите запуск, чтобы проверить чистый restart. Smoke не заменяет проверку DNS leak и не доказывает сам по себе, что внешний IP изменился. Не запускайте native TUN из WSL: используйте Windows release binary через interop.
+Проверка результата руками: `Get-NetAdapter -Name vpn-helper`, `Get-NetRoute`,
+смена внешнего IP (`curl https://api.ipify.org` до/после `t`), после выхода — ни
+процессов, ни адаптеров, ни маршрутов.
+
+## Ограничения (честно)
+
+- Бесплатные публичные VLESS-серверы живут часы — приложение это переживает
+  (health-check, быстрый переподключение, сохранение рабочих), но для 24/7
+  нужен свой сервер.
+- TUN-режим — Windows only (wintun); SOCKS-режим кроссплатформенный.
+- Один внешний VPN одновременно: конкурирующие клиенты (Amnezia и т.п.) нужно отключать.
+
+## Стек
+
+Rust 2021 · ratatui/crossterm (TUI) · reqwest (network) · serde_json (конфиги) ·
+clap (CLI) · внешние ядра xray-core + sing-box
