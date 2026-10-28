@@ -1,3 +1,4 @@
+mod debug_log;
 mod discovery;
 pub mod server_scan;
 mod singbox;
@@ -42,6 +43,9 @@ pub(crate) struct Args {
     /// Подробные логи внешнего core
     #[arg(long, short = 'v')]
     pub(crate) verbose: bool,
+    /// Отладочный лог всего приложения в debug.log (процессы, события, ошибки)
+    #[arg(long)]
+    pub(crate) debug: bool,
 }
 
 fn load_profile(args: &Args) -> Result<vless::VlessProfile> {
@@ -59,6 +63,17 @@ fn load_profile(args: &Args) -> Result<vless::VlessProfile> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.debug {
+        debug_log::init();
+        dlog!("args: {:?}", args);
+        // Паники в raw-mode TUI невидимы в терминале: ловим и пишем в debug.log.
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            dlog!("PANIC: {info}");
+            debug_log::log("=== session aborted by panic ===");
+            default_hook(info);
+        }));
+    }
     if args.tunnel {
         let profile = load_profile(&args)?;
         return tun::run(&args, &profile);
@@ -67,7 +82,7 @@ fn main() -> Result<()> {
         // TUN-режиму нужны права администратора: при запуске без них
         // перезапускаем себя через UAC-диалог.
         if cfg!(windows) && !is_elevated() {
-            elevate_relaunch()?;
+            elevate_relaunch(&args)?;
         }
         return tui::run(&args.servers_dir, || Ok(()));
     }
@@ -84,7 +99,7 @@ fn is_elevated() -> bool {
 }
 
 /// Перезапуск себя от имени администратора через UAC-диалог.
-fn elevate_relaunch() -> Result<()> {
+fn elevate_relaunch(args: &Args) -> Result<()> {
     let exe = std::env::current_exe().context("Не удалось определить путь к exe")?;
     use std::os::windows::process::CommandExt;
     let status = Command::new("powershell")
@@ -92,9 +107,10 @@ fn elevate_relaunch() -> Result<()> {
             "-NoProfile",
             "-Command",
             &format!(
-                "Start-Process -FilePath '{}' -ArgumentList '--tui --servers-dir \"{}\"' -Verb RunAs",
+                "Start-Process -FilePath '{}' -ArgumentList '--tui --servers-dir \"{}\"{}' -Verb RunAs",
                 exe.display(),
                 std::env::current_dir().unwrap_or_default().display(),
+                if args.debug { " --debug" } else { "" },
             ),
         ])
         .creation_flags(0x08000000) // CREATE_NO_WINDOW

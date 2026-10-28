@@ -34,6 +34,21 @@ impl RunningSingBox {
         self.cleanup()
     }
 
+    /// Хвост лога sing-box (последние ~1.5КБ) — для диагностики падений TUN.
+    /// Читается ДО stop(): cleanup удаляет runtime-каталог вместе с логами.
+    pub fn log_tail(&self) -> Option<String> {
+        let path = self.runtime_dir.join("singbox-err.log");
+        let bytes = fs::read(&path).or_else(|_| fs::read(self.runtime_dir.join("singbox.log"))).ok()?;
+        let text = String::from_utf8_lossy(&bytes);
+        let mut lines: Vec<&str> = text.lines().collect();
+        let tail: Vec<&str> = if lines.len() > 8 {
+            lines.split_off(lines.len() - 8)
+        } else {
+            lines
+        };
+        (!tail.is_empty()).then(|| tail.join("\n"))
+    }
+
     fn stop_child(&mut self) -> Result<()> {
         if self.child_stopped {
             return Ok(());
@@ -153,8 +168,14 @@ pub fn start_for_tui(
         .args(["run", "-c"])
         .arg(&config_path)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        // Логи пишутся в файл: пайпы без читателя блокируют sing-box,
+        // когда ОС-буфер (~64КБ) переполняется системным трафиком.
+        .stdout(Stdio::from(fs::File::create(
+            runtime_dir.join("singbox.log"),
+        )?))
+        .stderr(Stdio::from(
+            fs::File::create(runtime_dir.join("singbox-err.log"))?,
+        ));
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -447,9 +468,31 @@ pub fn build_config(profile: &VlessProfile, mtu: u16, interface_name: &str) -> R
         bail!("Недопустимое имя TUN-интерфейса");
     }
     let outbound = outbound(profile)?;
-    // Домен прокси-сервера резолвим локально (мимо туннеля), иначе DNS-петля:
-    // proxy-dns ходит через прокси, а прокси требует резолва собственного домена.
+    // Домен/IP прокси-сервера резолвим и маршрутизируем локально (мимо туннеля),
+    // иначе петля: исходящий VLESS-коннект sing-box уходит в собственный TUN.
     let host_domain = Value::String(profile.host.clone());
+    // Если host — IP, добавляем ip_cidr-правило (domain-правило IP не матчит).
+    let host_is_ip = profile.host.parse::<std::net::Ipv4Addr>().is_ok()
+        || profile.host.parse::<std::net::Ipv6Addr>().is_ok();
+    let host_ip = if host_is_ip {
+        vec![Value::String(profile.host.clone())]
+    } else {
+        Vec::new()
+    };
+    let mut rules = vec![
+        json!({"action": "sniff"}),
+        json!({"protocol": "dns", "action": "hijack-dns"}),
+        json!({"ip_is_private": true, "action": "route", "outbound": "direct"}),
+    ];
+    if !host_ip.is_empty() {
+        rules.push(json!({
+            "ip_cidr": host_ip, "action": "route", "outbound": "direct"
+        }));
+    } else {
+        rules.push(json!({
+            "domain": [host_domain], "action": "route", "outbound": "direct"
+        }));
+    }
     Ok(json!({
         "log": { "level": "info" },
         "dns": {
@@ -463,19 +506,14 @@ pub fn build_config(profile: &VlessProfile, mtu: u16, interface_name: &str) -> R
         "inbounds": [{
             "type": "tun", "tag": "tun-in", "interface_name": interface_name,
             "address": ["172.19.0.1/30"], "mtu": mtu,
-            "auto_route": true, "strict_route": true, "stack": "system"
+            "auto_route": true, "strict_route": false, "stack": "mixed"
         }],
         "outbounds": [outbound, {"type":"direct","tag":"direct"}, {"type":"block","tag":"block"}],
         "route": {
             "auto_detect_interface": true,
             "default_domain_resolver": "local-dns",
             "final": "proxy",
-            "rules": [
-                {"action": "sniff"},
-                {"protocol": "dns", "action": "hijack-dns"},
-                {"domain": [host_domain], "action": "route", "outbound": "direct"},
-                {"ip_is_private": true, "action": "route", "outbound": "direct"}
-            ]
+            "rules": rules
         }
     }))
 }
@@ -493,6 +531,30 @@ pub fn build_config_via_socks(
         bail!("Недопустимое имя TUN-интерфейса");
     }
     let host_domain = Value::String(profile.host.clone());
+    // IP VLESS-сервера должен идти в direct, иначе Xray, подключаясь к нему,
+    // заворачивает свой трафик в TUN → SOCKS самого себя → петля.
+    // Это работает и когда host — IP (2.27.118.10), и когда домен (резолвится).
+    let host_ip = if profile.host.parse::<std::net::Ipv4Addr>().is_ok()
+        || profile.host.parse::<std::net::Ipv6Addr>().is_ok()
+    {
+        vec![Value::String(profile.host.clone())]
+    } else {
+        Vec::new()
+    };
+    let mut rules = vec![
+        json!({"action": "sniff"}),
+        json!({"protocol": "dns", "action": "hijack-dns"}),
+        json!({"ip_is_private": true, "action": "route", "outbound": "direct"}),
+    ];
+    if !host_ip.is_empty() {
+        rules.push(json!({
+            "ip_cidr": host_ip, "action": "route", "outbound": "direct"
+        }));
+    } else {
+        rules.push(json!({
+            "domain": [host_domain], "action": "route", "outbound": "direct"
+        }));
+    }
     Ok(json!({
         "log": { "level": "info" },
         "dns": {
@@ -506,7 +568,7 @@ pub fn build_config_via_socks(
         "inbounds": [{
             "type": "tun", "tag": "tun-in", "interface_name": interface_name,
             "address": ["172.19.0.1/30"], "mtu": mtu,
-            "auto_route": true, "strict_route": true, "stack": "system"
+            "auto_route": true, "strict_route": false, "stack": "mixed"
         }],
         "outbounds": [
             {"type": "socks", "tag": "proxy", "server": "127.0.0.1", "server_port": socks_port},
@@ -517,12 +579,7 @@ pub fn build_config_via_socks(
             "auto_detect_interface": true,
             "default_domain_resolver": "local-dns",
             "final": "proxy",
-            "rules": [
-                {"action": "sniff"},
-                {"protocol": "dns", "action": "hijack-dns"},
-                {"domain": [host_domain], "action": "route", "outbound": "direct"},
-                {"ip_is_private": true, "action": "route", "outbound": "direct"}
-            ]
+            "rules": rules
         }
     }))
 }
@@ -602,11 +659,13 @@ mod tests {
         assert_eq!(config["inbounds"][0]["type"], "tun");
         assert_eq!(config["inbounds"][0]["interface_name"], "vpn-helper");
         assert_eq!(config["inbounds"][0]["auto_route"], true);
-        assert_eq!(config["inbounds"][0]["strict_route"], true);
+        // strict_route выключен: со включённым sing-box на Windows глох
+        // при strict_route + system stack (см. баг с падением TUN).
+        assert_eq!(config["inbounds"][0]["strict_route"], false);
+        assert_eq!(config["inbounds"][0]["stack"], "mixed");
         assert_eq!(config["outbounds"][0]["type"], "vless");
         assert_eq!(config["route"]["rules"][0]["action"], "sniff");
         assert_eq!(config["route"]["rules"][1]["action"], "hijack-dns");
-        // домен прокси-сервера резолвится локально, чтобы избежать DNS-петли
         assert_eq!(config["route"]["rules"][2]["action"], "route");
         // домен прокси-сервера резолвится локально (default_domain_resolver), петли нет
         assert_eq!(config["route"]["default_domain_resolver"], "local-dns");
@@ -616,6 +675,18 @@ mod tests {
         assert!(parse_readiness_output("true").unwrap());
         assert!(!parse_readiness_output("false\r\n").unwrap());
         assert!(parse_readiness_output("unexpected").is_err());
+    }
+
+    #[test]
+    fn builds_tun_config_ip_host_gets_ip_rule() {
+        // IP-хост: правило маршрутизации должно быть ip_cidr (domain IP не матчит),
+        // иначе исходящий коннект к серверу уходит в TUN → петля.
+        let p = vless::parse_for_test("vless://8c8a8681-5444-4e18-a427-54f19eea6a77@2.27.118.10:443?security=reality&pbk=public&fp=firefox&type=tcp&sni=host.invalid", Path::new("x")).unwrap();
+        let config = build_config(&p, 1400, "vpn-helper").unwrap();
+        let rules = &config["route"]["rules"];
+        assert_eq!(rules[3]["ip_cidr"][0], "2.27.118.10");
+        assert_eq!(rules[3]["action"], "route");
+        assert_eq!(rules[3]["outbound"], "direct");
     }
 
     #[test]

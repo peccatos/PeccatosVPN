@@ -5,6 +5,7 @@ use crate::{
     vless::{ProfileState, VlessProfile},
     xray,
 };
+use crate::{debug_log, dlog};
 use anyhow::{Context, Result};
 use crossterm::{
     cursor,
@@ -251,8 +252,8 @@ enum WorkerEvent {
     CheckAllFinished(u64, usize, usize),
     /// Системный TUN поднят.
     TunUp(u64, singbox::RunningSingBox),
-    /// TUN не удалось поднять.
-    TunFailed(u64),
+    /// TUN не удалось поднять (хвост лога sing-box для диагностики).
+    TunFailed(u64, Option<String>),
 }
 
 struct TerminalGuard;
@@ -274,12 +275,30 @@ pub fn run(servers_dir: &Path, mut disconnect: impl FnMut() -> Result<()>) -> Re
     terminal.clear()?;
 
     let (tx, rx) = mpsc::channel();
+    // Зачистка потерянных xray-процессов от аварийно закрытых сессий.
+    let cleaned = xray::cleanup_orphaned_xray();
+    if cleaned > 0 {
+        dlog!("startup: cleaned {cleaned} orphaned xray processes");
+    }
     let discovery = discovery::scan_directory(servers_dir);
     let mut app = App::new(discovery, servers_dir);
-    app.message = format!(
-        "Локально найдено профилей: {} • Нажмите g для публичных источников",
-        app.profiles.len()
-    );
+    app.message = if debug_log::is_enabled() {
+        format!(
+            "DEBUG: лог пишется в {} • профилей: {}",
+            debug_log::path().map(|p| p.display().to_string()).unwrap_or_default(),
+            app.profiles.len()
+        )
+    } else if cleaned > 0 {
+        format!(
+            "Зачищено потерянных процессов xray: {cleaned} • Локально профилей: {} • g — публичные источники",
+            app.profiles.len()
+        )
+    } else {
+        format!(
+            "Локально найдено профилей: {} • Нажмите g для публичных источников",
+            app.profiles.len()
+        )
+    };
     let mut last_health_check = Instant::now();
 
     while !app.should_quit {
@@ -287,7 +306,9 @@ pub fn run(servers_dir: &Path, mut disconnect: impl FnMut() -> Result<()>) -> Re
         while let Ok(event) = rx.try_recv() {
             apply_worker_event(&mut app, event);
         }
-        // Health-check: раз в HEALTH_CHECK_INTERVAL проверяем живость прокси.
+        // Health-check: раз в HEALTH_CHECK_INTERVAL проверяем живость канала.
+        // При активном TUN — системным запросом (без прокси: трафик пойдёт
+        // через TUN, как у обычных приложений); иначе — через SOCKS Xray.
         if app.status.is_active()
             && app.runtime.is_some()
             && last_health_check.elapsed() >= HEALTH_CHECK_INTERVAL
@@ -299,9 +320,16 @@ pub fn run(servers_dir: &Path, mut disconnect: impl FnMut() -> Result<()>) -> Re
                 .as_ref()
                 .map(xray::RunningXray::socks_port)
                 .expect("runtime проверён выше");
+            let via_tun = app.tun.is_some();
             let tx = tx.clone();
             thread::spawn(move || {
-                let healthy = xray::check_traffic(port).is_ok();
+                let healthy = if via_tun {
+                    // ВАЖНО: сначала проверяем, что адаптер реально существует —
+                    // иначе запрос уйдёт через Wi-Fi/другой VPN и даст ложное «жив».
+                    tun_adapter_alive() && xray::check_traffic_system().is_ok()
+                } else {
+                    xray::check_traffic(port).is_ok()
+                };
                 let _ = tx.send(WorkerEvent::HealthChecked(id, healthy));
             });
         }
@@ -452,6 +480,7 @@ fn handle_key(
             let id = app.request_id;
             let tx = tx.clone();
             thread::spawn(move || {
+                dlog!("tun: start_for_tui begin, socks_port={socks_port}, profile={}:{}", profile.host, profile.port);
                 let event = match singbox::start_for_tui(
                     None,
                     &profile,
@@ -460,6 +489,7 @@ fn handle_key(
                     "vpn-helper",
                 ) {
                     Ok(mut running) => {
+                        dlog!("tun: sing-box started, waiting for TUN interface");
                         // Ждём готовности TUN-интерфейса до 30 сек.
                         let deadline = Instant::now() + Duration::from_secs(30);
                         let mut ready = false;
@@ -470,19 +500,25 @@ fn handle_key(
                                     break;
                                 }
                                 Ok(false) => thread::sleep(Duration::from_millis(400)),
-                                Err(_) => break,
+                                Err(error) => {
+                                    dlog!("tun: tun_ready error: {error}");
+                                    break;
+                                }
                             }
                         }
+                        dlog!("tun: ready={ready}");
                         if ready {
                             WorkerEvent::TunUp(id, running)
                         } else {
+                            // Хвост лога ДО stop(): runtime удаляется при остановке.
+                            let tail = running.log_tail();
                             let _ = running.stop();
-                            WorkerEvent::TunFailed(id)
+                            WorkerEvent::TunFailed(id, tail)
                         }
                     }
                     Err(error) => {
-                        let _ = error;
-                        WorkerEvent::TunFailed(id)
+                        dlog!("tun: start_for_tui error: {error}");
+                        WorkerEvent::TunFailed(id, Some(error.to_string()))
                     }
                 };
                 let _ = tx.send(event);
@@ -746,9 +782,11 @@ fn handle_key(
             });
         }
         KeyCode::Char('d') if !app.busy => {
+            dlog!("disconnect: stopping TUN and Xray");
             // Сначала гасим TUN, затем Xray.
             if let Some(mut tun) = app.tun.take() {
                 let _ = tun.stop();
+                dlog!("disconnect: TUN stopped");
                 app.message = "TUN-интерфейс остановлен. ".into();
             }
             if let Some(runtime) = app.runtime.take() {
@@ -845,6 +883,7 @@ fn fetch_single_source(url: &str) -> DiscoveryResult {
 }
 
 fn apply_worker_event(app: &mut App, event: WorkerEvent) {
+    dlog!("worker event: {}", event_name(&event));
     match event {
         WorkerEvent::ScanFinished(id, is_public, result) if id == app.request_id => {
             app.busy = false;
@@ -950,25 +989,71 @@ fn apply_worker_event(app: &mut App, event: WorkerEvent) {
             app.tun = Some(running);
             app.message = "Системный TUN активен: весь трафик ОС идёт через VPN".into();
         }
-        WorkerEvent::TunFailed(id) if id == app.request_id => {
+        WorkerEvent::TunFailed(id, detail) if id == app.request_id => {
             app.busy = false;
-            app.message =
-                "TUN не поднялся (проверьте права администратора и наличие sing-box)".into();
+            app.message = match detail {
+                Some(tail) => {
+                    format!("TUN не поднялся:\n{tail}")
+                }
+                None => "TUN не поднялся (проверьте права администратора и наличие sing-box)"
+                    .into(),
+            };
         }
         WorkerEvent::HealthChecked(id, healthy) if id == app.request_id => {
+            let via_tun = app.tun.is_some();
             if healthy {
                 if app.status.is_active() {
-                    app.message = "Health-check: соединение живо (chatgpt.com доступен)".into();
+                    app.message = if via_tun {
+                        "Health-check: TUN жив — системный трафик идёт через VPN".into()
+                    } else {
+                        "Health-check: соединение живо (chatgpt.com доступен)".into()
+                    };
                 }
             } else if app.status.is_active() {
-                // Прокси не отвечает: переводим в Lost, Xray оставляем —
+                // Канал не отвечает: переводим в Lost, Xray/TUN оставляем —
                 // пользователь может переподключиться (d → Enter) или подождать.
                 app.status = ConnectionState::Lost;
-                app.message =
-                    "Health-check не прошёл: сервер перестал отвечать. Нажмите d, затем Enter для переподключения".into();
+                app.message = if via_tun {
+                    "TUN-канал не отвечает: нажмите d, затем Enter для переподключения".into()
+                } else {
+                    "Health-check не прошёл: сервер перестал отвечать. Нажмите d, затем Enter для переподключения".into()
+                };
             }
         }
         _ => {}
+    }
+}
+
+/// Жив ли TUN-адаптер vpn-helper (без PowerShell — прямой WMI-запрос).
+#[cfg(windows)]
+fn tun_adapter_alive() -> bool {
+    std::process::Command::new("wmic")
+        .args(["nic", "where", "NetConnectionID='vpn-helper'", "get", "NetConnectionID"])
+        .output()
+        .map(|output| {
+            let text = String::from_utf8_lossy(&output.stdout);
+            text.contains("vpn-helper")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn tun_adapter_alive() -> bool {
+    std::path::Path::new("/sys/class/net/vpn-helper").exists()
+}
+
+/// Короткое имя события для debug-лога.
+fn event_name(event: &WorkerEvent) -> &'static str {
+    match event {
+        WorkerEvent::ScanFinished(..) => "ScanFinished",
+        WorkerEvent::ProbeFinished(..) => "ProbeFinished",
+        WorkerEvent::Connected(..) => "Connected",
+        WorkerEvent::HealthChecked(..) => "HealthChecked",
+        WorkerEvent::CheckAllStarted(..) => "CheckAllStarted",
+        WorkerEvent::CheckAllItem(..) => "CheckAllItem",
+        WorkerEvent::CheckAllFinished(..) => "CheckAllFinished",
+        WorkerEvent::TunUp(..) => "TunUp",
+        WorkerEvent::TunFailed(..) => "TunFailed",
     }
 }
 

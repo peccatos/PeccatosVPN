@@ -1,4 +1,5 @@
 use crate::{vless::VlessProfile, xray_config};
+use crate::dlog;
 use anyhow::{bail, Context, Result};
 use reqwest::blocking::Client;
 use std::{
@@ -38,6 +39,88 @@ pub fn check_traffic_with_ping(port: u16) -> Result<Duration> {
     let started = Instant::now();
     check_traffic(port)?;
     Ok(started.elapsed())
+}
+
+/// Системный health-check при активном TUN: прямой запрос без прокси.
+/// Если TUN жив — запрос уходит в туннель, как у обычных приложений.
+/// ВАЖНО: использовать только при активном TUN, иначе проверяет
+/// прямую сеть (и всегда «успешно» из РФ мимо VPN).
+pub fn check_traffic_system() -> Result<()> {
+    let client = Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(8))
+        .build()?;
+    let response = client.get("https://chatgpt.com/").send()?;
+    let status = response.status();
+    if !status.is_success() && !status.is_client_error() && !status.is_server_error() {
+        bail!("Неожиданный ответ от chatgpt.com: HTTP {status}");
+    }
+    Ok(())
+}
+
+/// Зачистка потерянных xray-процессов от прошлых сессий (TUI закрыт
+/// аварийно — kill терминала, паника). Наши процессы опознаются по
+/// аргументу `-c ...vpn-helper-xray-<pid>\config.json` в командной строке.
+/// Возвращает число завершённых процессов. Текущий PID не трогаем.
+pub fn cleanup_orphaned_xray() -> usize {
+    let marker = "vpn-helper-xray-";
+    let own_dir = format!("vpn-helper-xray-{}", std::process::id());
+    let output = if cfg!(windows) {
+        std::process::Command::new("wmic")
+            .args(["process", "where", "name='xray.exe'", "get", "ProcessId,CommandLine"])
+            .output()
+    } else {
+        std::process::Command::new("sh")
+            .args(["-c", "ps -eo pid,args | grep '[x]ray.*vpn-helper-xray-'"])
+            .output()
+    };
+    let Ok(output) = output else {
+        return 0;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut killed = 0;
+    for line in text.lines() {
+        // Формат wmic: <commandline> <pid> — pid последнее число в строке;
+        // формат ps: <pid> <args> — pid первое число.
+        if !line.contains(marker) {
+            continue;
+        }
+        let pid = if cfg!(windows) {
+            line.split_whitespace()
+                .filter_map(|token| token.parse::<u32>().ok())
+                .next_back()
+        } else {
+            line.split_whitespace()
+                .filter_map(|token| token.parse::<u32>().ok())
+                .next()
+        };
+        let Some(pid) = pid else { continue };
+        if pid == std::process::id() {
+            continue;
+        }
+        // Не убиваем процессы, чей каталог конфига относится к текущему PID.
+        if line.contains(&own_dir) {
+            continue;
+        }
+        let result = if cfg!(windows) {
+            std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+        } else {
+            std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+        };
+        if result.is_ok_and(|status| status.success()) {
+            killed += 1;
+        }
+    }
+    killed
 }
 
 impl RunningXray {
@@ -194,9 +277,17 @@ pub fn start(profile: &VlessProfile) -> Result<RunningXray> {
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("Не удалось запустить {}", binary.display()))?;
+    dlog!(
+        "xray: started pid={} port={} profile={}:{}",
+        child.id(),
+        port,
+        profile.host,
+        profile.port
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            dlog!("xray: socks ready pid={}", child.id());
             return Ok(RunningXray {
                 child,
                 config,
@@ -210,6 +301,7 @@ pub fn start(profile: &VlessProfile) -> Result<RunningXray> {
     }
     let _ = child.kill();
     let _ = fs::remove_file(&config);
+    dlog!("xray: FAILED to open SOCKS port in 5s, pid killed");
     bail!("Xray не открыл локальный SOCKS-порт")
 }
 
