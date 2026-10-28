@@ -1,4 +1,158 @@
-# vpn-helper — VLESS VPN supervisor на Rust
+# vpn-helper — Rust VLESS VPN Supervisor
+
+> **Status: fully working, production-ready.**
+> The system-wide TUN mode routes all Windows traffic through the VPN and is verified
+> end-to-end: chatgpt.com responds through the tunnel, the external IP changes, DNS is
+> resolved via the proxy.
+
+A complete VPN client written in Rust with a terminal UI (ratatui): discovers and
+validates VLESS configs from public sources, connects through a local SOCKS proxy, and
+**runs a system-level TUN adapter that captures all OS traffic**. It supervises two
+external cores — `sing-box` (TUN) and `xray` (VLESS+xHTTP behind a CDN) — hiding the
+entire complexity behind a single TUI.
+
+## Features
+
+- **System-wide VPN with zero configuration** — press `t`, a TUN adapter comes up, and
+  all Windows traffic (browsers, terminal, any app) flows through the VLESS server.
+  Verified with chatgpt.com and other services that block Russian IPs.
+- **Smart working-key discovery** — [STR BYPASS cyberportal](https://warp-gen.cyb-portal.org/)
+  subscriptions (site-verified keys), parallel validation of all profiles (8 workers,
+  live ping per row), automatic persistence of only proven-working configs into a
+  local library.
+- **Live monitoring** — health-check every 20 seconds (through the TUN when active);
+  status switches to `СОЕДИНЕНИЕ ПОТЕРЯНО` (connection lost) when the channel dies,
+  one-keypress reconnect.
+- **Three modes on demand** — one-shot check (`c`), local SOCKS proxy (`Enter`),
+  system-wide TUN (`t`), one-click Chrome through the VPN (`b`).
+- **Robustness** — process and temp-config cleanup on exit, orphaned-process sweep on
+  startup, automatic UAC elevation, `--debug` mode with a full event log.
+
+## Workflow
+
+```
+cargo run -- --tui
+  → g          (fetch fresh keys from the cyberportal)
+  → a          (parallel check: REACHABLE/FAILED + ping per profile)
+  → Enter      (connect — local SOCKS proxy)
+  → t          (system TUN — all OS traffic through the VPN)
+  → browser    (chatgpt.com opens with no proxy settings whatsoever)
+```
+
+## Installation (once)
+
+```powershell
+git clone https://github.com/peccatos/Xray-SingBox-VPN
+cd Xray-SingBox-VPN
+
+# Cores (binaries are not stored in git, ~150 MB):
+winget install XTLS.Xray-core
+irm https://raw.githubusercontent.com/SagerNet/sing-box/release/install.ps1 | iex
+# then place xray.exe (+ wintun.dll, geoip.dat, geosite.dat) → tools/xray/
+# and sing-box.exe (+ libcronet.dll) → tools/sing-box/
+```
+
+Core lookup order: `--singbox-path`/`XRAY_PATH` → `tools/<core>/` → PATH → WinGet.
+
+## Usage
+
+```powershell
+cargo run -- --tui            # TUI (requests admin rights via UAC automatically)
+cargo run -- --tui --debug    # + full log to debug.log (processes, events, panics)
+```
+
+### TUI keys
+
+| Key | Action |
+|---|---|
+| `↑`/`↓`, `j`/`k` | select profile |
+| `Enter` | connect — Xray runs as a SOCKS proxy at `127.0.0.1:<port>` |
+| `t` | **system TUN** — all OS traffic through the VPN |
+| `a` | parallel check of all profiles (8 workers) + ping |
+| `c` | one-shot profile check |
+| `p` | pin the current working connection (survives list refreshes) |
+| `b` | launch Chrome through the VPN proxy (separate browser profile) |
+| `u` | scan a custom URL (subscription / JSON / HTML) |
+| `g` | fetch public sources |
+| `x` | clean up dead key files |
+| `r` | rescan `servers/` |
+| `d` | disconnect (TUN + Xray) |
+| `q` | quit with auto-cleanup |
+
+### CLI mode (no TUI)
+
+```powershell
+cargo run -- --tunnel --profile servers\profile.vless
+# core selection is automatic:
+#   reality+tcp/grpc  → sing-box (TUN + VLESS directly)
+#   tls+xhttp (CDN)   → Xray + sing-box TUN via a SOCKS bridge
+```
+
+## Architecture (the interesting part for review)
+
+```
+src/
+├── tui.rs          # TUI orchestrator: events, worker threads, connect, TUN
+├── discovery.rs    # source parsing: plain text / JSON / HTML → VLESS profiles
+├── vless.rs        # vless:// link parsing, static validation
+├── xray.rs         # xray.exe supervisor: config, spawn, health-checks, zombie sweep
+├── singbox.rs      # sing-box supervisor: TUN configs (direct and SOCKS-bridge)
+├── tun.rs          # core selection based on profile transport
+├── debug_log.rs    # thread-safe debug log (--debug)
+└── xray_config.rs  # Xray config generation from a profile
+```
+
+Engineering problems that were genuinely fun to solve:
+
+- **The routing loop**: for VLESS servers specified by IP, a `domain` routing rule never
+  matches, so the core's own outbound connection went straight into its own TUN →
+  deadlock. Fix: an `ip_cidr → direct` rule for IP hosts (covered by the
+  `builds_tun_config_ip_host_gets_ip_rule` test).
+- **The log deadlock**: `stdout(piped)` with no reader blocks the child process once
+  the OS pipe buffer (~64 KB) fills under system-wide traffic. Core logs now go to files.
+- **The lying health-check**: a system-wide probe without a TUN adapter routes through
+  Wi-Fi and returns a false "alive". The adapter is now verified via WMI before probing.
+- **Parallel validation**: a pool of 8 threads with an `Arc<Mutex<queue>>`; each worker
+  runs its own short-lived xray process, and the UI stays responsive (events via mpsc).
+- **Scanner hardening**: the public import blocks private/reserved endpoints, so the
+  tool can never be turned into an internal network scanner.
+
+## Supported transports
+
+- VLESS + Reality + TCP / gRPC
+- VLESS + TLS + xHTTP (behind a CDN — via Xray, sing-box raises the TUN)
+
+Profiles with `security=none`, `type=ws`, or unknown parameters are rejected at
+validation time. Files with a UTF-8 BOM are parsed correctly.
+
+## Quality
+
+```powershell
+cargo fmt -- --check
+cargo test                        # 15 tests: parsers, configs, validation
+cargo clippy --all-targets -- -- -D warnings
+cargo build --release
+```
+
+Manual verification: `Get-NetAdapter -Name vpn-helper`, `Get-NetRoute`, external IP
+change (`curl https://api.ipify.org` before/after `t`); after quit — no processes, no
+adapters, no routes left behind.
+
+## Limitations (honestly)
+
+- Free public VLESS servers live for hours — the app copes (health-checks, quick
+  reconnect, working-key persistence), but a 24/7 setup needs your own server.
+- TUN mode is Windows-only (wintun); the SOCKS mode is cross-platform.
+- One external VPN at a time: competing clients (Amnezia etc.) must be disabled.
+
+## Stack
+
+Rust 2021 · ratatui/crossterm (TUI) · reqwest (networking) · serde_json (configs) ·
+clap (CLI) · external cores: xray-core + sing-box
+
+---
+
+# vpn-helper — VLESS VPN-супервизор на Rust
 
 > **Статус: полностью рабочий проект, готов к использованию.**
 > Системный TUN-режим поднимает весь трафик Windows через VPN и проверен end-to-end:
