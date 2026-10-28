@@ -152,7 +152,7 @@ clap (CLI) · external cores: xray-core + sing-box
 
 ---
 
-# vpn-helper — VLESS VPN-супервизор на Rust
+# PeccatosVPN — VLESS VPN-супервизор на Rust
 
 > **Статус: полностью рабочий проект, готов к использованию.**
 > Системный TUN-режим поднимает весь трафик Windows через VPN и проверен end-to-end:
@@ -192,8 +192,8 @@ cargo run -- --tui
 ## Установка (один раз)
 
 ```powershell
-git clone https://github.com/peccatos/Xray-SingBox-VPN
-cd Xray-SingBox-VPN
+git clone https://github.com/peccatos/PeccatosVPN
+cd PeccatosVPN
 
 # Ядра (бинарники не хранятся в git, ~150 МБ):
 winget install XTLS.Xray-core
