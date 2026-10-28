@@ -1,10 +1,8 @@
 servers/
 target/
 tools/
-.claude/
 public-*.txt
 test-config*.json
 tunnel_dump*.json
 test_xray*.sh
 install-release.sh
-claude-*.md
