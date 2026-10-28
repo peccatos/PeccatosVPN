@@ -118,6 +118,70 @@ pub fn run_via_socks(args: &Args, profile: &VlessProfile, socks_port: u16) -> Re
     run_with_mode(args, profile, mode)
 }
 
+/// Запуск TUN в неблокирующем режиме для TUI: возвращает RunningSingBox,
+/// готовность интерфейса TUI проверяет сам через tun_ready().
+pub fn start_for_tui(
+    singbox_path: Option<&Path>,
+    profile: &VlessProfile,
+    socks_port: Option<u16>,
+    mtu: u16,
+    tun_name: &str,
+) -> Result<RunningSingBox> {
+    let binary = discover(singbox_path)
+        .context("sing-box не найден. Установите sing-box.exe в PATH или tools/sing-box")?;
+    let config = match socks_port {
+        None => build_config(profile, mtu, tun_name)?,
+        Some(port) => build_config_via_socks(profile, mtu, tun_name, port)?,
+    };
+    let runtime_dir = unique_runtime_dir()?;
+    let config_path = runtime_dir.join("config.json");
+    fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
+    let check = Command::new(&binary)
+        .args(["check", "-c"])
+        .arg(&config_path)
+        .output()
+        .with_context(|| format!("Не удалось проверить {}", binary.display()))?;
+    if !check.status.success() {
+        let _ = fs::remove_dir_all(&runtime_dir);
+        bail!(
+            "sing-box отклонил конфигурацию: {}",
+            redact(&String::from_utf8_lossy(&check.stderr))
+        );
+    }
+    let mut command = Command::new(&binary);
+    command
+        .args(["run", "-c"])
+        .arg(&config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&runtime_dir);
+            return Err(error.into());
+        }
+    };
+    Ok(RunningSingBox {
+        child,
+        runtime_dir,
+        config_path,
+        keep_config: None,
+        child_stopped: false,
+        cleaned: false,
+    })
+}
+
+impl RunningSingBox {
+    /// Готов ли TUN-интерфейс (для поллинга из TUI).
+    pub fn tun_ready(&mut self, interface_name: &str) -> Result<bool> {
+        if let Some(status) = self.child.try_wait()? {
+            bail!("sing-box завершился: {status}");
+        }
+        windows_tun_ready(interface_name)
+    }
+}
+
 pub enum CoreMode {
     Direct,
     ViaSocks(u16),

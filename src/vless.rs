@@ -36,6 +36,10 @@ impl VlessProfile {
     pub(crate) fn uuid(&self) -> &str {
         &self.uuid
     }
+    /// Исходная vless://-ссылка (для сохранения в файл).
+    pub fn raw_link(&self) -> &str {
+        &self._raw
+    }
 }
 
 pub(crate) fn load_path(path: &Path) -> Result<VlessProfile> {

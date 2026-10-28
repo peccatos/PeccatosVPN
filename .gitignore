@@ -1,54 +1,10 @@
-# Сборка
-/target
-
-# Локальные артефакты диагностики (дампы конфигов туннеля)
-tunnel_dump*.json
-tunnel_dump*.conf
-
-# Локальные тестовые конфиги и скрипты
-test-config*.json
-test_xray*.sh
-
-# Локальные заметки (не для публикации)
-клод
-claude-ревью.md
-ссылки на генераторы.txt
-wsl.localhost*
-*.local
-
-# Мусор: скачанная HTML-страница под именем .sh и локальные настройки
-install-release.sh
+servers/
+target/
+tools/
 .claude/
-
-
-# Личные ключи: профиль-файлы в servers/ содержат секретные UUID —
-# оставляем каталог с .gitkeep, но не коммитим ключи.
-# Свои ключи кладите локально, для шаблона см. servers/README
-servers/*
-!servers/.gitkeep
-!servers/README.md
-
-# Rust
-**/*.rs.bk
-
-# IDE/ОС
-.idea/
-.vscode/
-*.swp
-.DS_Store
-Thumbs.db
-
-# Временные файлы vpn-helper
-vpn-helper-singbox-*
-vpn-helper-xray-*
-
-# Тяжёлые бандлы: 150 МБ бинарников в git не тащим.
-# Пользователь после клона подтягивает их одной командой (см. README, «Установка ядер»)
-# либо sing-box/xray уже стоят в PATH/WinGet — discover() найдёт их сам.
-tools/sing-box/sing-box.exe
-tools/sing-box/libcronet.dll
-tools/xray/xray.exe
-tools/xray/geoip.dat
-tools/xray/geosite.dat
-tools/xray/wintun.dll
-
+public-*.txt
+test-config*.json
+tunnel_dump*.json
+test_xray*.sh
+install-release.sh
+claude-*.md

@@ -19,14 +19,25 @@ pub struct RunningXray {
 pub fn check_traffic(port: u16) -> Result<()> {
     let client = Client::builder()
         .proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}"))?)
-        .connect_timeout(Duration::from_secs(8))
-        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(8))
         .build()?;
-    let response = client.get("https://api.ipify.org").send()?;
-    if !response.status().is_success() {
-        bail!("HTTPS через Xray вернул HTTP {}", response.status());
+    // ChatGPT — лучший индикатор живого проксированного трафика.
+    // Сам HTTP-ответ уже доказывает работу прокси: статус может быть любым
+    // (Cloudflare отдаёт 403 без JS и это нормально).
+    let response = client.get("https://chatgpt.com/").send()?;
+    let status = response.status();
+    if !status.is_success() && !status.is_client_error() && !status.is_server_error() {
+        bail!("Неожиданный ответ от chatgpt.com: HTTP {status}");
     }
     Ok(())
+}
+
+/// Проверка трафика с замером задержки: возвращает пинг в миллисекундах.
+pub fn check_traffic_with_ping(port: u16) -> Result<Duration> {
+    let started = Instant::now();
+    check_traffic(port)?;
+    Ok(started.elapsed())
 }
 
 impl RunningXray {

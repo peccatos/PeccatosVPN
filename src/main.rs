@@ -10,6 +10,7 @@ mod xray_config;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
+use std::process::Command;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -63,7 +64,43 @@ fn main() -> Result<()> {
         return tun::run(&args, &profile);
     }
     if args.tui {
+        // TUN-режиму нужны права администратора: при запуске без них
+        // перезапускаем себя через UAC-диалог.
+        if cfg!(windows) && !is_elevated() {
+            elevate_relaunch()?;
+        }
         return tui::run(&args.servers_dir, || Ok(()));
     }
     bail!("Укажите --tui или --tunnel --profile <файл>; используйте --help")
+}
+
+/// Проверка прав администратора (Windows).
+fn is_elevated() -> bool {
+    std::process::Command::new("net")
+        .args(["session"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Перезапуск себя от имени администратора через UAC-диалог.
+fn elevate_relaunch() -> Result<()> {
+    let exe = std::env::current_exe().context("Не удалось определить путь к exe")?;
+    use std::os::windows::process::CommandExt;
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Start-Process -FilePath '{}' -ArgumentList '--tui --servers-dir \"{}\"' -Verb RunAs",
+                exe.display(),
+                std::env::current_dir().unwrap_or_default().display(),
+            ),
+        ])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .status();
+    match status {
+        Ok(_) => std::process::exit(0),
+        Err(error) => bail!("Не удалось запросить повышение прав: {error}"),
+    }
 }

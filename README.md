@@ -41,17 +41,37 @@ Profiles with `security=none`, `type=ws`, `tls+tcp` and unknown parameters are r
 
 Key files with a UTF-8 BOM are parsed correctly (BOM is stripped).
 
-## TUI and local checking
+## TUI: connect, check, and system-wide TUN
 
 ```powershell
 cargo run -- --tui
 ```
 
-The TUI scans `servers/` for profiles; pressing `c` starts Xray solely to check HTTPS through a local SOCKS port. This is **not** a system VPN and does not change Windows routes.
+On Windows the app requests UAC elevation automatically at startup (needed for the system TUN mode) and relaunches itself as administrator.
 
-Public sources (`g`) include the vless-checker keys.json (refreshed every ~30 minutes, keys with latency metrics). JSON sources are parsed automatically: keys are extracted from `best`/`top10[].key` fields.
+The TUI scans `servers/` for profiles; `g` fetches fresh public keys. The primary source is the [STR BYPASS cyberportal](https://warp-gen.cyb-portal.org/) subscriptions (CP-002/005/007/008) — site-verified keys in the supported transports (xhttp+tls, reality+tcp), refreshed by the portal daily. Sources in plain text, JSON and HTML are all parsed; a custom URL can be scanned with `u`.
 
-Keys: `↑`/`↓` or `j`/`k` — select; `c`/Enter — SOCKS check; `r` — rescan; `g` — fetch allowed HTTPS sources; `q`/Esc — quit.
+Keys:
+
+| Key | Action |
+|---|---|
+| `↑`/`↓` or `j`/`k` | select profile |
+| `Enter` | **connect** — Xray stays running as a local SOCKS proxy (`127.0.0.1:<port>`) |
+| `t` | **system-wide TUN** — route all OS traffic through the current connection (sing-box; admin required) |
+| `c` | one-shot check of the selected profile (Xray starts, HTTPS via SOCKS, Xray stops) |
+| `a` | check **all** profiles in parallel (8 workers), live status + ping per row |
+| `p` | pin the current working connection (survives list refreshes) |
+| `b` | launch Chrome through the VPN proxy (separate browser profile) |
+| `u` | scan a custom URL (subscription, keys.json, HTML page) |
+| `x` | clean up dead local key files |
+| `g` | fetch public sources |
+| `r` | rescan `servers/` |
+| `d` | disconnect (stops TUN and Xray) |
+| `q`/Esc | quit (auto-cleanup) |
+
+Working profiles (reachable check or successful connect) are **persisted to `servers/`** (`public-<host>-<port>.txt`), so your local library only accumulates keys proven to work. A health-check runs every 20 s against chatgpt.com; if the proxy dies the status switches to `СОЕДИНЕНИЕ ПОТЕРЯНО` (red).
+
+Note: `Enter`/`c`/`b` modes give you a local SOCKS proxy — only apps pointed at the proxy use the VPN. For all-OS traffic press `t` after connecting (TUN via sing-box). Parallel checking (`a`) keeps running while connected: each profile is checked by its own short-lived Xray process, not through the active tunnel.
 
 ## A note on public keys
 
@@ -111,17 +131,37 @@ cargo run -- --tunnel --profile servers\profile.vless
 
 Файлы ключей с UTF-8 BOM читаются корректно (BOM отбрасывается).
 
-## TUI и локальная проверка
+## TUI: подключение, проверка и системный TUN
 
 ```powershell
 cargo run -- --tui
 ```
 
-TUI ищет профили в `servers` и по клавише `c` запускает Xray только для проверки HTTPS через локальный SOCKS. Это **не** системный VPN и не меняет маршруты Windows.
+При старте на Windows приложение само запрашивает повышение прав через UAC (нужно для системного TUN) и перезапускается от администратора.
 
-Публичные источники (`g`) включают keys.json vless-checker (обновляется каждые ~30 минут, ключи с метриками latency). JSON-источники разбираются автоматически: ключи извлекаются из полей `best`/`top10[].key`.
+TUI сканирует `servers/` на профили; `g` подтягивает свежие публичные ключи. Основной источник — подписки [киберпортала STR BYPASS](https://warp-gen.cyb-portal.org/) (CP-002/005/007/008): проверенные сайтом ключи в поддерживаемых транспортах (xhttp+tls, reality+tcp), портал обновляет их ежедневно. Разбираются источники в plain text, JSON и HTML; свой URL сканируется клавишей `u`.
 
-Клавиши: `↑`/`↓` или `j`/`k` — выбор; `c`/Enter — SOCKS-проверка; `r` — пересканировать; `g` — загрузить разрешённые HTTPS-источники; `q`/Esc — выход.
+Клавиши:
+
+| Клавиша | Действие |
+|---|---|
+| `↑`/`↓` или `j`/`k` | выбор профиля |
+| `Enter` | **подключить** — Xray остаётся работать как локальный SOCKS-прокси (`127.0.0.1:<порт>`) |
+| `t` | **системный TUN** — весь трафик ОС через текущее подключение (sing-box; нужны права админа) |
+| `c` | разовая проверка выбранного профиля (Xray стартует, HTTPS через SOCKS, Xray останавливается) |
+| `a` | проверка **всех** профилей параллельно (8 воркеров), статусы и ping в реальном времени |
+| `p` | закрепить текущее рабочее подключение (переживает обновления списка) |
+| `b` | запустить Chrome через VPN-прокси (отдельный профиль браузера) |
+| `u` | просканировать свой URL (подписка, keys.json, HTML-страница) |
+| `x` | почистить мёртвые локальные файлы ключей |
+| `g` | загрузить публичные источники |
+| `r` | пересканировать `servers/` |
+| `d` | отключить (останавливает TUN и Xray) |
+| `q`/Esc | выход (автоочистка) |
+
+Рабочие профили (успешная проверка или подключение) **сохраняются в `servers/`** (`public-<host>-<port>.txt`) — в локальной библиотеке копятся только подтверждённо живые ключи. Каждые 20 с идёт health-check через chatgpt.com; если прокси умер, статус переключается на `СОЕДИНЕНИЕ ПОТЕРЯНО` (красный).
+
+Учтите: `Enter`/`c`/`b` дают локальный SOCKS-прокси — VPN работает только у приложений, которым прокси указан. Для всего трафика ОС нажмите `t` после подключения. Параллельная проверка (`a`) работает и при активном подключении: каждый профиль проверяется своим короткоживущим Xray-процессом, а не через активный туннель.
 
 ## Про публичные ключи
 

@@ -10,10 +10,18 @@ const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_URLS: usize = 2048;
 
+/// Основной источник: киберпортал STR BYPASS (warp-gen.cyb-portal.org).
+/// Подписки CP-xxx обновляются сайтом и содержат проверенные ключи
+/// в поддерживаемых транспортах (xhttp+tls, reality+tcp/grpc).
 pub const PUBLIC_SOURCES: &[&str] = &[
-    "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/githubmirror/clean/vless.txt",
-    "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/githubmirror/ru-sni/vless_ru.txt",
-    "https://tiagorrg.github.io/vless-checker/keys.json",
+    // VLESS Black All RU — основной список xhttp+tls
+    "https://warp-gen.cyb-portal.org/CP-002",
+    // VLESS Reality — reality+tcp и xhttp
+    "https://warp-gen.cyb-portal.org/CP-005",
+    // VLESS CIDR White Checked RU — проверенные xhttp
+    "https://warp-gen.cyb-portal.org/CP-007",
+    // VLESS SNI White — reality+tcp
+    "https://warp-gen.cyb-portal.org/CP-008",
 ];
 
 #[derive(Clone, Debug)]
@@ -37,6 +45,23 @@ pub struct DiscoveryResult {
     pub files_seen: usize,
     pub files_read: usize,
     pub urls_found: usize,
+}
+
+/// Сохраняет ОДИН рабочий профиль в `root` как локальный файл
+/// (public-<host>-<port>.txt). Вызывается только для подтверждённо
+/// рабочих конфигов (REACHABLE / успешное подключение).
+/// Возвращает true, если файл записан (или уже существует).
+pub fn persist_working_profile(root: &Path, profile: &VlessProfile) -> bool {
+    if fs::create_dir_all(root).is_err() {
+        return false;
+    }
+    let host = profile.host.replace(['/', '\\', ':'], "-");
+    let filename = format!("public-{}-{}.txt", host, profile.port);
+    let path = root.join(filename);
+    if path.exists() {
+        return true;
+    }
+    fs::write(&path, format!("{}\n", profile.raw_link())).is_ok()
 }
 
 pub fn scan_directory(root: &Path) -> DiscoveryResult {
@@ -109,10 +134,39 @@ pub fn scan_public_source(text: &str, source: &str) -> DiscoveryResult {
                 },
             );
         }
+    } else if is_html_source(trimmed) {
+        // HTML-страницы (vpnkeys.me и подобные): vless:// может быть в атрибутах
+        // href/data-*, внутри <pre>/<code> или JS-переменных. Декодируем общие
+        // HTML-сущности и обрезаем ссылку по ближайшей кавычке или тегу.
+        let decoded = decode_html_entities(trimmed.to_string());
+        add_text(&mut result, &decoded, source_ref);
+        if result.profiles.is_empty() {
+            result.diagnostics.push(format!(
+                "HTML-источник не отдал VLESS-ключей (возможно, они подгружаются через JS): {source}"
+            ));
+        }
     } else {
         add_text(&mut result, text, source_ref);
     }
     result
+}
+
+fn is_html_source(trimmed: &str) -> bool {
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("<!doctype html") || lower.starts_with("<html")
+}
+
+/// Декодирует минимальный набор HTML-сущностей, в которых может
+/// оказаться vless://-ссылка внутри HTML-документа.
+fn decode_html_entities(text: String) -> String {
+    if !text.contains('&') {
+        return text;
+    }
+    text.replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
 }
 
 /// Извлекает все vless://-ссылки из JSON произвольной вложенности
@@ -191,8 +245,12 @@ fn add_text(result: &mut DiscoveryResult, text: &str, source: SourceRef) {
         let mut rest = line;
         while let Some(start) = rest.find("vless://") {
             let candidate = &rest[start..];
-            let end = candidate
-                .find(char::is_whitespace)
+            // Конец ссылки: пробел в тексте, кавычка или `<` в HTML-атрибутах.
+            let end = ['"', '\'', '<']
+                .into_iter()
+                .filter_map(|ch| candidate.find(ch))
+                .min()
+                .or_else(|| candidate.find(char::is_whitespace))
                 .unwrap_or(candidate.len());
             let trimmed = candidate[..end].trim_matches(|ch: char| "\"'`()[]{}<>,.;".contains(ch));
             result.urls_found += 1;
@@ -278,6 +336,28 @@ mod tests {
     #[test]
     fn json_source_without_keys_reports_diagnostic() {
         let result = scan_public_source(r#"{"updated_at": "now"}"#, "keys.json");
+        assert!(result.profiles.is_empty());
+        assert!(!result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn extracts_keys_from_html_source() {
+        // формат страницы вида vpnkeys.me/protocol/vless/
+        let html = concat!(
+            "<!DOCTYPE html><html><head><title>VPNKeys</title></head><body>",
+            "<a href=\"vless://8c8a8681-5444-4e18-a427-54f19eea6a77@host.invalid:443?security=tls&amp;type=xhttp&amp;sni=host.invalid&amp;path=%2F\">copy</a>",
+            "<pre>vless://99999999-9999-4999-8999-999999999999@other.invalid:443?security=tls&type=xhttp&sni=other.invalid&path=%2F</pre>",
+            "</body></html>"
+        );
+        let result = scan_public_source(html, "https://vpnkeys.me/protocol/vless/");
+        assert_eq!(result.profiles.len(), 2);
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn html_source_without_keys_reports_diagnostic() {
+        let html = "<!DOCTYPE html><html><body>loading...</body></html>";
+        let result = scan_public_source(html, "https://vpnkeys.me/protocol/vless/");
         assert!(result.profiles.is_empty());
         assert!(!result.diagnostics.is_empty());
     }
