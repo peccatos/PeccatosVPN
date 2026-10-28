@@ -1,4 +1,4 @@
-# vpn-helper — Rust VLESS VPN Supervisor
+# PeccatosVPN — Rust VLESS VPN Supervisor
 
 > **Status: fully working, production-ready.**
 > The system-wide TUN mode routes all Windows traffic through the VPN and is verified
@@ -42,8 +42,8 @@ cargo run -- --tui
 ## Installation (once)
 
 ```powershell
-git clone https://github.com/peccatos/Xray-SingBox-VPN
-cd Xray-SingBox-VPN
+git clone https://github.com/peccatos/PeccatosVPN
+cd PeccatosVPN
 
 # Cores (binaries are not stored in git, ~150 MB):
 winget install XTLS.Xray-core
